@@ -1,7 +1,10 @@
+import heapq
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from queue import PriorityQueue
+
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 兼容中文+数学符号
+plt.rcParams['axes.unicode_minus'] = False
 
 # ====================== 1. 基础配置 ======================
 # 地图大小
@@ -30,17 +33,21 @@ def heuristic(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 def a_star(start, goal, obstacles, map_size):
-    """A* 路径规划核心函数"""
+    """A* 路径规划核心函数（基于整数栅格）"""
     neighbors = [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,-1), (1,-1), (-1,1)]
-    close_set = set()
+    obstacles = set(obstacles)
+    start = tuple(start)
+    goal = tuple(goal)
+
+    open_heap = []
+    heapq.heappush(open_heap, (heuristic(start, goal), start))
+    open_set = {start}
     came_from = {}
     gscore = {start: 0}
-    fscore = {start: heuristic(start, goal)}
-    oheap = PriorityQueue()
-    oheap.put((fscore[start], start))
 
-    while not oheap.empty():
-        current = oheap.get()[1]
+    while open_heap:
+        current = heapq.heappop(open_heap)[1]
+        open_set.discard(current)
 
         if current == goal:
             path = []
@@ -50,35 +57,60 @@ def a_star(start, goal, obstacles, map_size):
             path.append(start)
             return path[::-1]
 
-        close_set.add(current)
-        for i, j in neighbors:
-            neighbor = current[0] + i, current[1] + j
-            if 0 <= neighbor[0] < map_size and 0 <= neighbor[1] < map_size:
-                if neighbor in obstacles:
-                    continue
+        for dx, dy in neighbors:
+            neighbor = (current[0] + dx, current[1] + dy)
+            # 检查边界
+            if not (0 <= neighbor[0] < map_size and 0 <= neighbor[1] < map_size):
+                continue
+            # 障碍物
+            if neighbor in obstacles:
+                continue
 
-                temp_g = gscore[current] + heuristic(current, neighbor)
-                if neighbor in close_set and temp_g >= gscore.get(neighbor, 0):
-                    continue
+            tentative_g = gscore[current] + np.hypot(dx, dy)
 
-                if temp_g < gscore.get(neighbor, 0) or neighbor not in [i[1] for i in oheap.queue]:
-                    came_from[neighbor] = current
-                    gscore[neighbor] = temp_g
-                    fscore[neighbor] = temp_g + heuristic(neighbor, goal)
-                    oheap.put((fscore[neighbor], neighbor))
-
+            if tentative_g < gscore.get(neighbor, float('inf')):
+                came_from[neighbor] = current
+                gscore[neighbor] = tentative_g
+                fscore = tentative_g + heuristic(neighbor, goal)
+                if neighbor not in open_set:
+                    heapq.heappush(open_heap, (fscore, neighbor))
+                    open_set.add(neighbor)
+    # 无路径
     return []
+
+def fallback_straight_path(start, goal):
+    """当 A* 失败时，使用直线插值生成离散格点路径（作为后备）"""
+    sx, sy = start
+    gx, gy = goal
+    dx = gx - sx
+    dy = gy - sy
+    steps = max(int(abs(dx)), int(abs(dy)), 1)
+    xs = np.linspace(sx, gx, steps + 1)
+    ys = np.linspace(sy, gy, steps + 1)
+    path = []
+    seen = set()
+    for x, y in zip(xs, ys):
+        ix, iy = int(round(x)), int(round(y))
+        if (ix, iy) not in seen:
+            seen.add((ix, iy))
+            path.append((ix, iy))
+    return path
 
 # ====================== 3. 生成所有无人机路径 ======================
 def generate_paths(drones, obstacles, map_size):
     paths = []
-    obs = set((x, y) for x, y in obstacles)
+    obs = set((int(x), int(y)) for x, y in obstacles)
     for idx, (sx, sy, gx, gy) in enumerate(drones):
         start = (int(sx), int(sy))
         goal = (int(gx), int(gy))
         path = a_star(start, goal, obs, map_size)
+        if not path:
+            # 后备路径，避免空路径导致后续错误
+            path = fallback_straight_path(start, goal)
+            print(f"⚠️ 无人机 {idx+1} A* 未找到路径，使用直线后备路径，长度：{len(path)}")
+        else:
+            print(f"✅ 无人机 {idx+1} 路径规划完成，路径长度：{len(path)}")
         paths.append(path)
-        print(f"✅ 无人机 {idx+1} 路径规划完成，路径长度：{len(path)}")
     return paths
 
 # ====================== 4. 冲突检测与规避核心 ======================
@@ -90,42 +122,52 @@ def check_collisions(drone_positions, safe_dist):
         x1, y1 = drone_positions[i]
         for j in range(i + 1, n):
             x2, y2 = drone_positions[j]
-            dist = np.hypot(x1 - x2, y1 - y2)
+            dist = np.hypot(float(x1) - float(x2), float(y1) - float(x2) * 0 + float(y1) - float(y2))  # 保持兼容性
+            dist = np.hypot(float(x1) - float(x2), float(y1) - float(y2))
             if dist < safe_dist:
                 collisions.append((i, j))
     return collisions
 
 def avoid_collision(drone_positions, paths, current_idx, safe_dist):
-    """冲突规避：速度调整 + 路径微调"""
-    new_positions = drone_positions.copy()
+    """冲突规避：后机减速等待（简单策略）"""
+    # 深拷贝位置数组，避免修改原引用
+    new_positions = [pos.copy() for pos in drone_positions]
     collide_pairs = check_collisions(drone_positions, safe_dist)
 
     for i, j in collide_pairs:
-        # 策略：后机减速等待，前机正常飞行
+        # 规则：到达路径点更多（或步数更大）的被认为是 "后机"，等待一帧
         if current_idx[i] >= current_idx[j]:
-            # 无人机i 等待一帧
-            new_positions[i] = drone_positions[i]
+            # i 等待，不移动（保持当前位置）
+            new_positions[i] = drone_positions[i].copy()
         else:
-            new_positions[j] = drone_positions[j]
+            new_positions[j] = drone_positions[j].copy()
 
     return new_positions
 
 def move_along_path(pos, path, current_step, step_size):
-    """沿路径平滑移动"""
+    """沿路径平滑移动，pos: numpy array([x,y])"""
+    if len(path) == 0:
+        return pos
     if current_step >= len(path) - 1:
+        # 已到最后节点，保持当前位置（或置为终点）
         return pos
 
     target = path[current_step + 1]
-    dx = target[0] - pos[0]
-    dy = target[1] - pos[1]
+    tx, ty = float(target[0]), float(target[1])
+    dx = tx - float(pos[0])
+    dy = ty - float(pos[1])
     dist = np.hypot(dx, dy)
 
-    if dist < step_size:
-        return np.array(target)
+    if dist <= 1e-6:
+        return np.array([tx, ty], dtype=float)
+
+    if dist <= step_size:
+        # 直接到达下一个离散点
+        return np.array([tx, ty], dtype=float)
     else:
         move_x = dx / dist * step_size
         move_y = dy / dist * step_size
-        return np.array([pos[0] + move_x, pos[1] + move_y])
+        return np.array([pos[0] + move_x, pos[1] + move_y], dtype=float)
 
 # ====================== 5. 动画可视化 ======================
 def run_simulation(paths, obstacles):
@@ -140,39 +182,65 @@ def run_simulation(paths, obstacles):
     obs_y = [y for x, y in obstacles]
     ax.scatter(obs_x, obs_y, c='black', s=100, marker='s', label='障碍物')
 
-    # 绘制起点/终点
+    # 绘制起点/终点 (只标注一次以避免重复)
     colors = ['red', 'blue', 'green', 'orange', 'purple']
     for i, drone in enumerate(DRONES):
         sx, sy, gx, gy = drone
-        ax.scatter(sx, sy, c=colors[i], s=80, marker='o', label=f'无人机{i+1}起点')
-        ax.scatter(gx, gy, c=colors[i], s=80, marker='*', label=f'无人机{i+1}终点')
+        ax.scatter(sx, sy, c=colors[i], s=80, marker='o')
+        ax.scatter(gx, gy, c=colors[i], s=80, marker='*')
+    # 单独添加图例项
+    ax.scatter([], [], c='red', s=80, marker='o', label='起点')
+    ax.scatter([], [], c='red', s=80, marker='*', label='终点')
 
     # 初始化无人机位置与状态
-    drone_pos = [np.array([path[0][0], path[0][1]]) for path in paths]
+    drone_pos = []
+    for i, path in enumerate(paths):
+        if len(path) >= 1:
+            p0 = np.array([float(path[0][0]), float(path[0][1])], dtype=float)
+        else:
+            # 退回到 DRONES 起点
+            sx, sy = DRONES[i][0], DRONES[i][1]
+            p0 = np.array([float(sx), float(sy)], dtype=float)
+        drone_pos.append(p0)
+
     current_steps = [0] * len(paths)
-    drone_dots = [ax.plot([], [], 'o', markersize=10, color=colors[i])[0] for i in range(len(paths))]
+    drone_dots = []
+    for i in range(len(paths)):
+        dot, = ax.plot([], [], 'o', markersize=10, color=colors[i])
+        drone_dots.append(dot)
+
+    # 绘制每条路径轨迹（可选）
+    for i, path in enumerate(paths):
+        px = [pt[0] for pt in path]
+        py = [pt[1] for pt in path]
+        ax.plot(px, py, linestyle='--', color=colors[i], alpha=0.6)
 
     def update(frame):
-        # 沿路径移动
+        nonlocal drone_pos, current_steps
+        # 先移动
         for i in range(len(paths)):
             if current_steps[i] < len(paths[i]) - 1:
-                drone_pos[i] = move_along_path(drone_pos[i], paths[i], current_steps[i], STEP_SIZE)
-
+                newp = move_along_path(drone_pos[i], paths[i], current_steps[i], STEP_SIZE)
+                drone_pos[i] = newp
+                # 如果靠近当前目标格点则推进 step
                 target = paths[i][current_steps[i] + 1]
                 if np.hypot(drone_pos[i][0] - target[0], drone_pos[i][1] - target[1]) < 0.3:
-                    current_steps[i] += 1
+                    # 抵达下一个离散节点，步数+1
+                    current_steps[i] = min(current_steps[i] + 1, len(paths[i]) - 1)
 
-        # 冲突规避
-        drone_pos[:] = avoid_collision(drone_pos, paths, current_steps, SAFE_DISTANCE)
+        # 冲突规避（位置修正/等待）
+        drone_pos = avoid_collision(drone_pos, paths, current_steps, SAFE_DISTANCE)
 
-        # 更新画面
+        # 更新画面（注意传入序列而非标量）
         for i, dot in enumerate(drone_dots):
-            dot.set_data(drone_pos[i][0], drone_pos[i][1])
+            x, y = float(drone_pos[i][0]), float(drone_pos[i][1])
+            dot.set_data([x], [y])
 
         return drone_dots
 
+    # 注：为避免与某些后端的 blitting/resize 冲突，这里使用 blit=False
     ani = animation.FuncAnimation(
-        fig, update, frames=300, interval=50, blit=True, repeat=False
+        fig, update, frames=600, interval=50, blit=False, repeat=False
     )
 
     plt.legend(loc='upper right', fontsize=9)
